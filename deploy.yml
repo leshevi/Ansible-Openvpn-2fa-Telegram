@@ -1,0 +1,5 @@
+- name: OpenVPN + Unbound DNS AdBlock + Traffic Monitor
+  hosts: openvpn_server
+  become: true
+  roles:
+    - openvpn

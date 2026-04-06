@@ -1,0 +1,12 @@
+openvpn_network: "10.8.0.0"
+openvpn_mask: "255.255.255.0"
+openvpn_port: 1194
+openvpn_proto: udp
+# Список клиентов для генерации
+openvpn_clients:
+  - client1
+  - phone_user
+  - laptop_user
+openvpn_token_bota: ""
+openvpn_chat_id: ""
+openvpn_unbound: https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts

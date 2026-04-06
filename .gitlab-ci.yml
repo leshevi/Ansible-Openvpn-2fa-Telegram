@@ -55,7 +55,7 @@ variables:
 
     - cat dynamic_inventory.json
     - ansible all -i ./dynamic_inventory.json -m ping
-      ls -la roles/
+    - ls -la roles/
     - ansible-lint -q --offline
     - ansible-playbook -i dynamic_inventory.json deploy.yml
 

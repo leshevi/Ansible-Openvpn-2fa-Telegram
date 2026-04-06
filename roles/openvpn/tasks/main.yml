@@ -1,0 +1,236 @@
+---
+- name: Installing required packages
+  ansible.builtin.apt:
+    name: [openvpn, easy-rsa, iptables-persistent, unbound, vnstat, curl, cron, libpam-google-authenticator, systemd-timesyncd, ntpdate]
+    state: present
+    update_cache: true
+
+- name: Disabling the conflicting one systemd-resolved
+  ansible.builtin.systemd:
+    name: systemd-resolved
+    state: stopped
+    enabled: false
+
+- name: Removing a broken link resolv.conf от systemd
+  ansible.builtin.file:
+    path: /etc/resolv.conf
+    state: absent
+
+- name: Setting up clean DNS for server operation (Cloudflare)
+  ansible.builtin.copy:
+    dest: /etc/resolv.conf
+    content: |
+      nameserver 1.1.1.1
+      nameserver 8.8.8.8
+    mode: '0644'
+
+- name: Initializing Easy-RSA and PKI
+  ansible.builtin.shell: |
+    make-cadir /etc/openvpn/easy-rsa
+    cd /etc/openvpn/easy-rsa
+    ./easyrsa init-pki
+    ./easyrsa --batch build-ca nopass
+    ./easyrsa --batch gen-dh
+    ./easyrsa --batch build-server-full server nopass
+    openvpn --genkey --secret ta.key
+    ./easyrsa gen-crl
+  args:
+    creates: /etc/openvpn/easy-rsa/pki/ca.crt
+
+- name: Copying server keys
+  ansible.builtin.copy:
+    src: "/etc/openvpn/easy-rsa/{{ item.src }}"
+    dest: "/etc/openvpn/{{ item.dest }}"
+    remote_src: true
+    mode: "0600"
+  loop:
+    - { src: 'pki/ca.crt', dest: 'ca.crt' }
+    - { src: 'pki/issued/server.crt', dest: 'server.crt' }
+    - { src: 'pki/private/server.key', dest: 'server.key' }
+    - { src: 'pki/dh.pem', dest: 'dh.pem' }
+    - { src: 'ta.key', dest: 'ta.key' }
+    - { src: 'pki/crl.pem', dest: 'crl.pem' }
+
+- name: Settings IP Forwarding and NAT
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: '1'
+    state: present
+    reload: true
+
+- name: Settings IPTables (NAT)
+  ansible.builtin.iptables:
+    table: nat
+    chain: POSTROUTING
+    source: "{{ openvpn_network }}/24"
+    jump: MASQUERADE
+
+- name: Saving rules IPTables
+  ansible.builtin.shell: iptables-save > /etc/iptables/rules.v4
+  changed_when: false
+
+- name: Setting access rights for Unbound
+  ansible.builtin.file:
+    path: /etc/unbound/ads.conf
+    owner: root
+    group: unbound
+    mode: '0644'
+    state: touch
+
+- name: Configuration Unbound (DNS + AdBlock)
+  ansible.builtin.template:
+    src: templates/unbound.conf.j2
+    dest: /etc/unbound/unbound.conf
+    mode: "0644"
+
+- name: Making Unbound Depend on OpenVPN (Systemd Override)
+  ansible.builtin.file:
+    path: /etc/systemd/system/unbound.service.d
+    state: directory
+    mode: '0755'
+
+- name: Setting up VPN interface waiting
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/unbound.service.d/wait-for-vpn.conf
+    content: |
+      [Unit]
+      After=openvpn@server.service
+      Requires=openvpn@server.service
+    mode: '0644'
+  notify: Restart unbound
+
+- name: Rebooting the daemon systemd (daemon-reload)
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Ad list update script
+  ansible.builtin.copy:
+    dest: /usr/local/bin/update-ads.sh
+    mode: '0755'
+    content: |
+      #!/bin/bash
+      curl -sS "{{ openvpn_unbound }}" | grep '^0.0.0.0' | awk '{print "local-zone: \""$2"\" static"}' > /etc/unbound/ads.conf
+      systemctl restart unbound
+
+- name: Running the ad blocker for the first time
+  ansible.builtin.command: /usr/local/bin/update-ads.sh
+  args:
+    creates: /etc/unbound/ads.conf
+
+- name: Enable time synchronization
+  ansible.builtin.command: timedatectl set-ntp true
+  changed_when: false
+
+- name: Server configuration OpenVPN
+  ansible.builtin.template:
+    src: templates/server.conf.j2
+    dest: /etc/openvpn/server.conf
+    mode: "0644"
+  notify: Restart openvpn
+
+- name: Generating client certificates
+  ansible.builtin.command: ./easyrsa --batch build-client-full {{ item }} nopass
+  args:
+    chdir: /etc/openvpn/easy-rsa
+    creates: "/etc/openvpn/easy-rsa/pki/issued/{{ item }}.crt"
+  loop: "{{ openvpn_clients }}"
+
+- name: Script for revoking certificates
+  ansible.builtin.copy:
+    dest: /usr/local/bin/revoke-vpn.sh
+    mode: '0755'
+    content: |
+      #!/bin/bash
+      cd /etc/openvpn/easy-rsa
+      ./easyrsa --batch revoke $1
+      ./easyrsa gen-crl
+      cp pki/crl.pem /etc/openvpn/crl.pem
+      systemctl restart openvpn@server
+
+- name: Setting up PAM for OpenVPN
+  ansible.builtin.copy:
+    dest: /etc/pam.d/openvpn
+    content: |
+      auth required pam_google_authenticator.so secret=/etc/openvpn/2fa/${USER}.google_authenticator user=root
+      account required pam_permit.so
+    mode: "0644"
+
+- name: Creating a directory for 2FA secrets
+  ansible.builtin.file:
+    path: /etc/openvpn/2fa
+    state: directory
+    mode: '0700'
+    owner: root
+
+- name: Script for generating a user's QR code
+  ansible.builtin.copy:
+    dest: /usr/local/bin/generate-2fa.sh
+    mode: '0755'
+    content: |
+      #!/bin/bash
+      USER_NAME=$1
+      SECRET_FILE="/etc/openvpn/2fa/${USER_NAME}.google_authenticator"
+      google-authenticator -t -d -f -r 3 -R 30 -W -s $SECRET_FILE
+      # Вывод ссылки на QR-код для удобства
+      SECRET=$(head -n 1 $SECRET_FILE)
+      echo "Для клиента $USER_NAME добавьте секрет вручную: $SECRET"
+      echo "Или отсканируйте QR-код по ссылке: https://google.com|0&cht=qr&chl=otpauth://totp/${USER_NAME}@VPN?secret=${SECRET}"
+
+- name: Enabling the PAM plugin in the server configuration
+  ansible.builtin.lineinfile:
+    path: /etc/openvpn/server.conf
+    line: 'plugin /usr/lib/x86_64-linux-gnu/openvpn/plugins/openvpn-plugin-auth-pam.so openvpn'
+  notify: Restart openvpn
+
+- name: Compiling .ovpn files for download
+  ansible.builtin.include_tasks: generate_client_configs.yml
+  loop: "{{ openvpn_clients }}"
+  loop_control:
+    loop_var: openvpn_client_name
+
+- name: Creating a directory for scripts
+  ansible.builtin.file:
+    path: /etc/openvpn/scripts
+    state: directory
+    mode: '0755'
+
+- name: Creating a Notification Script for Telegram
+  ansible.builtin.copy:
+    dest: /etc/openvpn/scripts/telegram-notify.sh
+    mode: '0755'
+    content: |
+      #!/bin/bash
+      # Настройки (вставьте свои данные)
+      TOKEN="{{ openvpn_token_bota }}"
+      CHAT_ID="{{ openvpn_chat_id }}"
+
+      if [ "$script_type" == "client-connect" ]; then
+        MSG="✅ *VPN Вход*
+        👤 Клиент: \`${common_name}\`
+        🌐 IP: \`${trusted_ip}\`
+        📅 Время: $(date '+%Y-%m-%d %H:%M:%S')"
+      elif [ "$script_type" == "client-disconnect" ]; then
+        # Конвертируем байты в мегабайты для удобства
+        RECV=$((bytes_received / 1024 / 1024))
+        SENT=$((bytes_sent / 1024 / 1024))
+
+        MSG="❌ *VPN Выход*
+        👤 Клиент: \`${common_name}\`
+        📥 Получено: ${RECV} MB
+        📤 Отправлено: ${SENT} MB
+        ⏳ Сессия завершена!"
+      fi
+
+      curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+            -d "chat_id=${CHAT_ID}" \
+            -d "text=${MSG}"
+
+- name: Configuring OpenVPN to Run a Script on Connection
+  ansible.builtin.lineinfile:
+    path: /etc/openvpn/server.conf
+    line: "{{ item }}"
+  loop:
+    - "script-security 2"
+    - "client-connect /etc/openvpn/scripts/telegram-notify.sh"
+    - "client-disconnect /etc/openvpn/scripts/telegram-notify.sh"
+  notify: Restart openvpn

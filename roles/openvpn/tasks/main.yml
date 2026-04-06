@@ -69,14 +69,6 @@
   ansible.builtin.shell: iptables-save > /etc/iptables/rules.v4
   changed_when: false
 
-- name: Setting access rights for Unbound
-  ansible.builtin.file:
-    path: /etc/unbound/ads.conf
-    owner: root
-    group: unbound
-    mode: '0644'
-    state: touch
-
 - name: Configuration Unbound (DNS + AdBlock)
   ansible.builtin.template:
     src: templates/unbound.conf.j2
@@ -102,20 +94,6 @@
 - name: Rebooting the daemon systemd (daemon-reload)
   ansible.builtin.systemd:
     daemon_reload: true
-
-- name: Ad list update script
-  ansible.builtin.copy:
-    dest: /usr/local/bin/update-ads.sh
-    mode: '0755'
-    content: |
-      #!/bin/bash
-      curl -sS "{{ openvpn_unbound }}" | grep '^0.0.0.0' | awk '{print "local-zone: \""$2"\" static"}' > /etc/unbound/ads.conf
-      systemctl restart unbound
-
-- name: Running the ad blocker for the first time
-  ansible.builtin.command: /usr/local/bin/update-ads.sh
-  args:
-    creates: /etc/unbound/ads.conf
 
 - name: Enable time synchronization
   ansible.builtin.command: timedatectl set-ntp true
@@ -187,6 +165,20 @@
   loop: "{{ openvpn_clients }}"
   loop_control:
     loop_var: openvpn_client_name
+
+- name: Ad list update script
+  ansible.builtin.copy:
+    dest: /usr/local/bin/update-ads.sh
+    mode: '0755'
+    content: |
+      #!/bin/bash
+      curl -sS "{{ openvpn_unbound }}" | grep '^0.0.0.0' | awk '{print "local-zone: \""$2"\" static"}' > /etc/unbound/ads.conf
+      systemctl restart unbound
+
+- name: Running the ad blocker for the first time
+  ansible.builtin.command: /usr/local/bin/update-ads.sh
+  args:
+    creates: /etc/unbound/ads.conf
 
 - name: Creating a directory for scripts
   ansible.builtin.file:

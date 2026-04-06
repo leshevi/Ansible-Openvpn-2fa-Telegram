@@ -1,0 +1,15 @@
+# meta/main.yml
+---
+galaxy_info:
+  role_name: openvpn
+  author: leshevi
+  description: A role for installing openvpn
+  license: license (GPLv3, MIT, etc)
+  min_ansible_version: "2.9"
+  platforms:
+    - name: Debian
+      versions:
+        - bullseye
+  galaxy_tags:
+    - openvpn
+dependencies: []

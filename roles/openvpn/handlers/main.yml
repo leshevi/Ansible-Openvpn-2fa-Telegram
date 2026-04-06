@@ -1,0 +1,11 @@
+- name: Restart openvpn
+  ansible.builtin.systemd:
+    name: openvpn@server
+    state: restarted
+    enabled: true
+
+- name: Restart unbound
+  ansible.builtin.systemd:
+    name: unbound
+    state: restarted
+    enabled: true

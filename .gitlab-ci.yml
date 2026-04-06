@@ -1,0 +1,65 @@
+stages:
+  - 🚀deploy
+
+variables:
+  ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
+  ANSIBLE_REMOTE_TMP: /tmp
+  ANSIBLE_FORCE_COLOR: 'true'
+  ANSIBLE_STARATEGY: linear
+  ANSIBLE_PIPELINING: 1
+  ANSIBLE_BECOME_USER: root
+  ANSIBLE_BECOME_ASKPASS: 'False'
+  ANSIBLE_FORCE_HANDLER: 'True'
+  ANSIBLE_ASK_PASS: 'False'
+  ANSIBLE_NOCOWS: 1
+  ANSIBLE_STDOUT_CALLBACK: "ansible.builtin.default"
+  ANSIBLE_RESULT_FORMAT: yaml
+  ANSIBLE_HOST_KEY_CHECKING: 'false'
+  ANSIBLE_DEPRECATION_WARNINGS: 'false'
+  ANSIBLE_TIMEOUT: 60
+  ANSIBLE_ROLES_PATH: "$CI_PROJECT_DIR/roles"
+  ARCHIVE: "$CI_PROJECT_DIR/backups"
+  TW_API_URL: "https://api.timeweb.cloud/api/v1/servers"
+  TARGET_COMMENT: openvpn
+
+🚀deploy_to_timeweb:
+  stage: 🚀deploy
+  tags:
+    - Docker
+  image: registry.gitlab.com/ansible_playbooks7843206/best_practices_alpine/ee:docker
+  before_script:
+    - eval $(ssh-agent -s)
+    - echo "$SSH_ROOT_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p $ANSIBLE_ROLES_PATH
+  script:
+    - mkdir -p $ARCHIVE
+    - |
+      curl -s -X GET "$TW_API_URL" \
+        -H "Authorization: Bearer $TOKEN_TIMEWEB" | jq --arg target "$TARGET_COMMENT" '
+      # Сначала фильтруем только нужные серверы
+      [.servers[] | select(.comment == $target)] as $filtered |
+      {
+        "all": {
+          "hosts": (
+            $filtered | map({
+              key: .name,
+              value: {
+                ansible_host: (.networks[].ips[] | select(.type == "ipv4") | .ip),
+                ansible_user: "ansible",
+                tw_comment: .comment
+              }
+            }) | from_entries
+          )
+        }
+      }' > dynamic_inventory.json
+
+    - cat dynamic_inventory.json
+    - ansible all -i ./dynamic_inventory.json -m ping
+      ls -la roles/
+    - ansible-lint -q --offline
+    - ansible-playbook -i dynamic_inventory.json deploy.yml
+
+  artifacts:
+    paths:
+      - $ARCHIVE
+    expire_in: 1 hour
